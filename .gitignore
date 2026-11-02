@@ -1,5 +1,94 @@
-.venv*/
+# Python bytecode and interpreter caches
 __pycache__/
 *.py[cod]
+*$py.class
+
+# Cross-platform virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+ENV/
+
+# Build, packaging, and installer output
+build/
+dist/
+downloads/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+*.spec
+
+# Test, coverage, type-checker, and linter state
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.pyright/
 .ruff_cache/
+.tox/
+.nox/
+test-results/
+
+# Local configuration, credentials, and certificates
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+
+# Contact lists and local campaign content
 *.csv
+*.xls
+*.xlsx
+*.xlsm
+*.docx
+contacts/
+imports/
+uploads/
+
+# Generated reports, exports, and logs
+reports/
+exports/
+logs/
+*.log
+*.log.*
+
+# Local Chrome and WhatsApp Web session state
+.mayfair-whatsapp-web/
+.chrome-profile/
+chrome-profile/
+user-data/
+
+# Temporary and backup files
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.code-workspace
+
+# Operating-system metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini
