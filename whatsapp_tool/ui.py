@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import queue
+import sys
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -15,6 +16,52 @@ from .sender import SenderSettings, WhatsAppWebSender
 from .templates import TemplateFileError, load_docx_template
 
 APP_TITLE = "Mayfair WhatsApp Web Sender"
+
+
+def calculate_window_geometry(
+    screen_width: int, screen_height: int
+) -> tuple[int, int, int, int]:
+    """Return a centered size that leaves room for macOS menus and the Dock."""
+
+    available_width = max(480, screen_width - 64)
+    available_height = max(520, screen_height - 120)
+    width = min(1180, available_width)
+    height = min(820, available_height)
+    x_position = max(0, (screen_width - width) // 2)
+    y_position = max(24, (screen_height - height) // 3)
+    return width, height, x_position, y_position
+
+
+class ScrollablePage(ttk.Frame):
+    """A vertically scrollable page whose body follows the window width."""
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent)
+        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(
+            self, orient=tk.VERTICAL, command=self.canvas.yview
+        )
+        self.body = ttk.Frame(self.canvas, padding=16)
+        self.body_window = self.canvas.create_window(
+            (0, 0), window=self.body, anchor=tk.NW
+        )
+
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.body.bind("<Configure>", self._sync_scroll_region)
+        self.canvas.bind("<Configure>", self._sync_body_width)
+
+    def _sync_scroll_region(self, _event: tk.Event) -> None:
+        bounds = self.canvas.bbox("all")
+        if bounds:
+            self.canvas.configure(scrollregion=bounds)
+
+    def _sync_body_width(self, event: tk.Event) -> None:
+        self.canvas.itemconfigure(self.body_window, width=event.width)
+
+    def scroll_units(self, units: int) -> None:
+        self.canvas.yview_scroll(units, "units")
 
 
 def _find_workspace_file(filename: str) -> str:
@@ -32,8 +79,12 @@ class SenderApp:
         self.log_file = configure_logging()
         self.logger = get_logger("ui")
         self.root.title(APP_TITLE)
-        self.root.geometry("1180x820")
-        self.root.minsize(960, 680)
+        width, height, x_position, y_position = calculate_window_geometry(
+            self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        )
+        self.root.geometry(f"{width}x{height}+{x_position}+{y_position}")
+        self.root.minsize(min(760, width), min(560, height))
+        self.window_width = width
 
         self.contacts: list[Contact] = []
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -62,6 +113,9 @@ class SenderApp:
 
         self._configure_style()
         self._build_ui()
+        self.root.bind("<MouseWheel>", self._scroll_page, add="+")
+        self.root.bind("<Button-4>", self._scroll_page, add="+")
+        self.root.bind("<Button-5>", self._scroll_page, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._process_events)
         self.root.after(250, self._load_defaults)
@@ -77,8 +131,9 @@ class SenderApp:
         style.configure("Treeview", rowheight=25)
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=16)
-        outer.pack(fill=tk.BOTH, expand=True)
+        self.scrollable_page = ScrollablePage(self.root)
+        self.scrollable_page.pack(fill=tk.BOTH, expand=True)
+        outer = self.scrollable_page.body
 
         header = ttk.Frame(outer)
         header.pack(fill=tk.X, pady=(0, 12))
@@ -87,6 +142,7 @@ class SenderApp:
             header,
             text="Review contacts, confirm consent, then send sequentially through your Chrome WhatsApp Web session.",
             style="Subtitle.TLabel",
+            wraplength=max(520, self.window_width - 80),
         ).pack(anchor=tk.W, pady=(3, 0))
 
         sources = ttk.LabelFrame(outer, text="1. Source files", padding=10)
@@ -154,11 +210,18 @@ class SenderApp:
             self.contact_tree.heading(column, text=label)
             self.contact_tree.column(column, width=width, minwidth=50, anchor=anchor)
         self.contact_tree.grid(row=0, column=0, sticky=tk.NSEW)
-        scrollbar = ttk.Scrollbar(
+        vertical_scrollbar = ttk.Scrollbar(
             tree_wrap, orient=tk.VERTICAL, command=self.contact_tree.yview
         )
-        scrollbar.grid(row=0, column=1, sticky=tk.NS)
-        self.contact_tree.configure(yscrollcommand=scrollbar.set)
+        vertical_scrollbar.grid(row=0, column=1, sticky=tk.NS)
+        horizontal_scrollbar = ttk.Scrollbar(
+            tree_wrap, orient=tk.HORIZONTAL, command=self.contact_tree.xview
+        )
+        horizontal_scrollbar.grid(row=1, column=0, sticky=tk.EW)
+        self.contact_tree.configure(
+            yscrollcommand=vertical_scrollbar.set,
+            xscrollcommand=horizontal_scrollbar.set,
+        )
         self.contact_tree.tag_configure(
             ContactState.INVALID.value, foreground="#b91c1c"
         )
@@ -177,7 +240,11 @@ class SenderApp:
             wraplength=390,
         ).grid(row=0, column=0, sticky=tk.W, pady=(0, 6))
         self.message_text = tk.Text(
-            message_frame, wrap=tk.WORD, undo=True, font=("TkDefaultFont", 10)
+            message_frame,
+            height=12,
+            wrap=tk.WORD,
+            undo=True,
+            font=("TkDefaultFont", 10),
         )
         self.message_text.grid(row=1, column=0, sticky=tk.NSEW)
         message_scroll = ttk.Scrollbar(
@@ -242,7 +309,12 @@ class SenderApp:
         ttk.Button(action_row, text="Export report…", command=self._export_report).pack(
             side=tk.LEFT, padx=(6, 0)
         )
-        ttk.Label(action_row, textvariable=self.status_text).pack(side=tk.RIGHT)
+        ttk.Label(
+            action_row,
+            textvariable=self.status_text,
+            width=32,
+            anchor=tk.E,
+        ).pack(side=tk.RIGHT)
 
         progress_row = ttk.Frame(outer)
         progress_row.pack(fill=tk.X, pady=(8, 0))
@@ -258,7 +330,7 @@ class SenderApp:
         log_toolbar.pack(fill=tk.X, pady=(0, 5))
         ttk.Label(
             log_toolbar,
-            text=f"Log file: {self.log_file}",
+            text=f"Log file: {self.log_file.name}",
             style="Subtitle.TLabel",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(log_toolbar, text="Copy activity", command=self._copy_activity).pack(
@@ -277,6 +349,37 @@ class SenderApp:
         )
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.configure(yscrollcommand=log_scroll.set)
+
+    def _scroll_page(self, event: tk.Event) -> str | None:
+        internal_scrollers = (
+            getattr(self, "contact_tree", None),
+            getattr(self, "message_text", None),
+            getattr(self, "log_text", None),
+        )
+        widget: tk.Misc | None = event.widget
+        while widget is not None:
+            if widget in internal_scrollers:
+                return None
+            widget = getattr(widget, "master", None)
+
+        event_number = getattr(event, "num", None)
+        if event_number == 4:
+            units = -3
+        elif event_number == 5:
+            units = 3
+        else:
+            delta = int(getattr(event, "delta", 0))
+            if not delta:
+                return None
+            if sys.platform == "darwin":
+                units = -delta
+            else:
+                units = (
+                    -(delta // 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+                )
+
+        self.scrollable_page.scroll_units(units)
+        return "break"
 
     def _load_defaults(self) -> None:
         if self.contacts_path.get():
