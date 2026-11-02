@@ -1,7 +1,8 @@
 """Cross-platform bootstrapper for the Mayfair WhatsApp Web Sender.
 
 Usage:
-    python3 run.py          # macOS/Linux
+    python3.15 run.py       # macOS with Python 3.15
+    python3 run.py          # Linux
     python run.py           # Windows
     python3 run.py --install
     python3 run.py --test   # install dependencies and run unit tests
@@ -21,11 +22,15 @@ REQUIREMENTS_FILE = PROJECT_DIRECTORY / "requirements.txt"
 MINIMUM_PYTHON = (3, 10)
 
 
-def venv_directory(platform_name: str = sys.platform) -> Path:
+def venv_directory(
+    platform_name: str = sys.platform,
+    python_version: tuple[int, int] | None = None,
+) -> Path:
     """Use separate environments where copied projects may cross platforms."""
 
     if platform_name == "darwin":
-        return PROJECT_DIRECTORY / ".venv-macos"
+        version = python_version or (sys.version_info.major, sys.version_info.minor)
+        return PROJECT_DIRECTORY / f".venv-macos-{version[0]}.{version[1]}"
     if platform_name == "win32":
         return PROJECT_DIRECTORY / ".venv-windows"
     return PROJECT_DIRECTORY / ".venv"

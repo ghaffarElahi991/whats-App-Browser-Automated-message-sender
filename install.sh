@@ -5,7 +5,26 @@ set -Eeuo pipefail
 PROJECT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIRECTORY"
 
-PYTHON_COMMAND="${PYTHON_COMMAND:-python3}"
+SYSTEM_NAME="$(uname -s)"
+
+if [[ -n "${PYTHON_COMMAND:-}" ]]; then
+    PYTHON_COMMAND="$PYTHON_COMMAND"
+elif [[ "$SYSTEM_NAME" == "Darwin" ]]; then
+    PYTHON_COMMAND=""
+    for candidate in \
+        python3.15 \
+        /Library/Frameworks/Python.framework/Versions/3.15/bin/python3.15 \
+        /opt/homebrew/bin/python3.15 \
+        /usr/local/bin/python3.15; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            PYTHON_COMMAND="$(command -v "$candidate")"
+            break
+        fi
+    done
+    PYTHON_COMMAND="${PYTHON_COMMAND:-python3.15}"
+else
+    PYTHON_COMMAND="python3"
+fi
 
 if ! command -v "$PYTHON_COMMAND" >/dev/null 2>&1; then
     echo "Error: Python 3.10 or newer was not found." >&2
@@ -19,7 +38,7 @@ echo "Preparing the Python environment..."
 echo "Running non-sending verification tests..."
 "$PYTHON_COMMAND" run.py --test
 
-case "$(uname -s)" in
+case "$SYSTEM_NAME" in
     Darwin)
         if [[ ! -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]] \
             && [[ ! -x "$HOME/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]]; then

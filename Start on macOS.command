@@ -5,15 +5,27 @@ set -u
 PROJECT_DIRECTORY="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIRECTORY" || exit 1
 
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "Python 3.10 or newer was not found."
+PYTHON_COMMAND=""
+for candidate in \
+    python3.15 \
+    /Library/Frameworks/Python.framework/Versions/3.15/bin/python3.15 \
+    /opt/homebrew/bin/python3.15 \
+    /usr/local/bin/python3.15; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        PYTHON_COMMAND="$(command -v "$candidate")"
+        break
+    fi
+done
+
+if [[ -z "$PYTHON_COMMAND" ]]; then
+    echo "Python 3.15 was not found."
     echo "Run 'Install on macOS.command' first."
     echo
     read -r -p "Press Return to close this window..." _response
     exit 1
 fi
 
-python3 run.py
+"$PYTHON_COMMAND" run.py
 exit_status=$?
 
 if [[ "$exit_status" -ne 0 ]]; then

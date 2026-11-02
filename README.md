@@ -24,7 +24,7 @@ Browser automation can break when WhatsApp changes its Web interface and may be 
 
 ### macOS double-click installation
 
-1. Install Google Chrome and Python 3.10+ from [python.org](https://www.python.org/downloads/macos/).
+1. Install Google Chrome and Python 3.15 from [python.org](https://www.python.org/downloads/macos/).
 2. Double-click **Install on macOS.command** in Finder.
 3. When installation finishes, double-click **Start on macOS.command** to open the application.
 
@@ -44,14 +44,20 @@ The installer checks Python, creates the platform-specific virtual environment, 
 To use a specific Python executable:
 
 ```bash
-PYTHON_COMMAND=/path/to/python3 ./install.sh
+PYTHON_COMMAND=python3.15 ./install.sh
 ```
 
 ## Run with one Python command
 
 The cross-platform Python launcher creates an isolated environment, installs requirements when they change, and opens the UI. Later launches reuse the environment.
 
-On macOS or Linux, open Terminal in this folder and run:
+On macOS with Python 3.15, open Terminal in this folder and run:
+
+```bash
+python3.15 run.py
+```
+
+On Linux, run:
 
 ```bash
 python3 run.py
@@ -69,7 +75,7 @@ or:
 py -3 run.py
 ```
 
-The launcher keeps macOS, Windows, and Linux virtual environments separate, so the same project folder can be moved between platforms. On macOS, the Python installer from [python.org](https://www.python.org/downloads/macos/) includes the Tkinter UI dependency. On Linux, install the operating system's `python3-tk` package if the launcher reports that Tkinter is missing.
+The launcher keeps macOS, Windows, and Linux virtual environments separate, so the same project folder can be moved between platforms. Python 3.15 on macOS uses `.venv-macos-3.15`, preventing an older environment from being reused. The Python installer from [python.org](https://www.python.org/downloads/macos/) includes the Tkinter UI dependency. On Linux, install the operating system's `python3-tk` package if the launcher reports that Tkinter is missing.
 
 ## Workflow
 
@@ -108,8 +114,8 @@ Format phone cells as **Text** in Excel so `+` and leading zeroes are preserved.
 The unit tests do not open Chrome or send messages. Run them through the same Python launcher:
 
 ```bash
-python3 run.py --test
+python3.15 run.py --test
 ```
 
-On Windows, use `python run.py --test` or `py -3 run.py --test`.
+On Linux, use `python3 run.py --test`. On Windows, use `python run.py --test` or `py -3 run.py --test`.
 # whats-App-Browser-Automated-message-sender

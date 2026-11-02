@@ -7,8 +7,8 @@ import run
 class BootstrapTests(unittest.TestCase):
     def test_mac_uses_separate_environment(self) -> None:
         self.assertEqual(
-            run.venv_directory("darwin"),
-            run.PROJECT_DIRECTORY / ".venv-macos",
+            run.venv_directory("darwin", (3, 15)),
+            run.PROJECT_DIRECTORY / ".venv-macos-3.15",
         )
 
     def test_windows_python_path(self) -> None:
