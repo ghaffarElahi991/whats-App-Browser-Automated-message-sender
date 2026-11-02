@@ -22,6 +22,16 @@ Browser automation can break when WhatsApp changes its Web interface and may be 
 
 ## Install on macOS or Linux
 
+### macOS double-click installation
+
+1. Install Google Chrome and Python 3.10+ from [python.org](https://www.python.org/downloads/macos/).
+2. Double-click **Install on macOS.command** in Finder.
+3. When installation finishes, double-click **Start on macOS.command** to open the application.
+
+If macOS blocks a downloaded script, Control-click it, select **Open**, and confirm **Open** once. The scripts remain local and can be inspected in any text editor.
+
+### Terminal installation
+
 From the project folder, run:
 
 ```bash
