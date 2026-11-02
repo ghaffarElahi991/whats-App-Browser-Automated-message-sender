@@ -20,6 +20,23 @@ Browser automation can break when WhatsApp changes its Web interface and may be 
 - Internet access on the first run to install Python packages and obtain a matching Chrome driver if needed
 - WhatsApp account with access to WhatsApp Web
 
+## Install on macOS or Linux
+
+From the project folder, run:
+
+```bash
+chmod +x install.sh
+./install.sh
+```
+
+The installer checks Python, creates the platform-specific virtual environment, installs all Python dependencies, validates Tkinter, checks for Chrome, and runs the non-sending tests. It does not open WhatsApp or send messages.
+
+To use a specific Python executable:
+
+```bash
+PYTHON_COMMAND=/path/to/python3 ./install.sh
+```
+
 ## Run with one Python command
 
 The cross-platform Python launcher creates an isolated environment, installs requirements when they change, and opens the UI. Later launches reuse the environment.

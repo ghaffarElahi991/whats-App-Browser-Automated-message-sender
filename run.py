@@ -3,6 +3,7 @@
 Usage:
     python3 run.py          # macOS/Linux
     python run.py           # Windows
+    python3 run.py --install
     python3 run.py --test   # install dependencies and run unit tests
 """
 
@@ -102,6 +103,18 @@ def main(arguments: list[str] | None = None) -> int:
         print(f"Could not prepare the Python environment: {exc}", file=sys.stderr)
         return 1
 
+    if arguments == ["--install"]:
+        if not tkinter_is_available(python_executable):
+            print(
+                "Tkinter is missing from this Python installation. On macOS, "
+                "install Python from python.org. On Linux, install your "
+                "distribution's python3-tk package, then run the installer again.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Python environment is ready: {venv_directory()}")
+        return 0
+
     if arguments == ["--test"]:
         return subprocess.run(
             [
@@ -118,7 +131,7 @@ def main(arguments: list[str] | None = None) -> int:
         ).returncode
 
     if arguments:
-        print("Supported option: --test", file=sys.stderr)
+        print("Supported options: --install, --test", file=sys.stderr)
         return 2
 
     if not tkinter_is_available(python_executable):
