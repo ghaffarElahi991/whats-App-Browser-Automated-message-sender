@@ -30,6 +30,8 @@ Browser automation can break when WhatsApp changes its Web interface and may be 
 
 If macOS blocks a downloaded script, Control-click it, select **Open**, and confirm **Open** once. The scripts remain local and can be inspected in any text editor.
 
+To download the newest committed code later, double-click **updateCodeOnMac.command**. It changes to the project folder automatically, runs `git pull`, and displays the result in Terminal.
+
 ### Terminal installation
 
 From the project folder, run:
