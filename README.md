@@ -105,6 +105,8 @@ If Chrome does not open, close any Chrome process already using the sender's ded
 
 On Linux, the sender isolates system Chrome from GTK/GSettings paths inherited from Snap-packaged editors such as VS Code. Those mixed paths can otherwise make visible Chrome exit during startup with `session not created` even though headless Chrome works.
 
+If a phone number is unavailable, WhatsApp may display a modal dialog. The sender closes that dialog, marks only that spreadsheet row as failed, and continues with the next contact. It also confirms that the message composer clears before recording a row as sent.
+
 ## Excel notes
 
 Format phone cells as **Text** in Excel so `+` and leading zeroes are preserved. Numbers are normalized to an international digits-only form before WhatsApp Web is opened. Structurally invalid and duplicate numbers are never sent.

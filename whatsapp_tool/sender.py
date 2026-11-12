@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,30 @@ _SNAP_GTK_VARIABLES = (
     "GTK_EXE_PREFIX",
     "GTK_PATH",
     "GTK_IM_MODULE_FILE",
+)
+
+_UNAVAILABLE_DIALOG_PHRASES = (
+    "phone number shared via url is invalid",
+    "phone number isn't on whatsapp",
+    "phone number is not on whatsapp",
+    "number isn't on whatsapp",
+    "number is not on whatsapp",
+    "invalid phone number",
+    "not a valid whatsapp number",
+    "couldn't find this phone number",
+    "could not find this phone number",
+)
+
+_SAFE_DIALOG_ACTIONS = (
+    "ok",
+    "okay",
+    "close",
+    "cancel",
+    "not now",
+    "got it",
+    "dismiss",
+    "continue to chat",
+    "continue",
 )
 
 
@@ -39,6 +64,26 @@ def build_chrome_environment(source: dict[str, str] | None = None) -> dict[str, 
     if original_xdg_data:
         environment["XDG_DATA_DIRS"] = original_xdg_data
     return environment
+
+
+def normalize_dialog_text(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def dialog_indicates_unavailable_contact(text: str) -> bool:
+    normalized = normalize_dialog_text(text)
+    return any(phrase in normalized for phrase in _UNAVAILABLE_DIALOG_PHRASES)
+
+
+def summarize_browser_error(error: BaseException, limit: int = 240) -> str:
+    summary = (
+        str(error).strip().splitlines()[0]
+        if str(error).strip()
+        else type(error).__name__
+    )
+    if summary.startswith("Message: "):
+        summary = summary.removeprefix("Message: ")
+    return summary if len(summary) <= limit else f"{summary[: limit - 1]}…"
 
 
 class BrowserAutomationError(RuntimeError):
@@ -91,6 +136,85 @@ class WhatsAppWebSender:
         self.on_progress = on_progress
         self.on_fatal = on_fatal
         self.driver = None
+
+    @staticmethod
+    def _visible_dialogs(driver: object, by: object) -> list[object]:
+        dialogs = driver.find_elements(  # type: ignore[attr-defined]
+            by.CSS_SELECTOR,
+            "div[role='dialog'][aria-modal='true']",  # type: ignore[attr-defined]
+        )
+        visible: list[object] = []
+        for dialog in dialogs:
+            try:
+                if dialog.is_displayed():  # type: ignore[attr-defined]
+                    visible.append(dialog)
+            except Exception:  # noqa: BLE001 - stale DOM nodes are ignored
+                continue
+        return visible
+
+    @staticmethod
+    def _dialog_text(dialog: object) -> str:
+        try:
+            return " ".join(str(dialog.text).split())  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - a rerendered dialog may be stale
+            return ""
+
+    def _dismiss_dialog(self, dialog: object, by: object, keys: object) -> bool:
+        assert self.driver is not None
+        from selenium.common.exceptions import WebDriverException
+
+        try:
+            buttons = dialog.find_elements(  # type: ignore[attr-defined]
+                by.CSS_SELECTOR,
+                "button, [role='button']",  # type: ignore[attr-defined]
+            )
+            for action in _SAFE_DIALOG_ACTIONS:
+                for button in buttons:
+                    label = normalize_dialog_text(
+                        " ".join(
+                            filter(
+                                None,
+                                (
+                                    getattr(button, "text", ""),
+                                    button.get_attribute("aria-label"),  # type: ignore[attr-defined]
+                                    button.get_attribute("title"),  # type: ignore[attr-defined]
+                                ),
+                            )
+                        )
+                    )
+                    if label != action:
+                        continue
+                    try:
+                        button.click()  # type: ignore[attr-defined]
+                    except WebDriverException:
+                        self.driver.execute_script("arguments[0].click();", button)
+                    return True
+
+            active_element = self.driver.switch_to.active_element
+            active_element.send_keys(keys.ESCAPE)  # type: ignore[attr-defined]
+            return True
+        except WebDriverException:
+            logger.exception("Could not dismiss a WhatsApp dialog")
+            return False
+
+    def _clear_stale_dialogs(self, by: object, keys: object) -> None:
+        assert self.driver is not None
+        for _attempt in range(3):
+            dialogs = self._visible_dialogs(self.driver, by)
+            if not dialogs:
+                return
+            text = self._dialog_text(dialogs[0])
+            logger.info("Dismissing stale WhatsApp dialog: %s", text or "<no text>")
+            if not self._dismiss_dialog(dialogs[0], by, keys):
+                raise BrowserAutomationError(
+                    "A WhatsApp dialog from the previous contact could not be closed."
+                )
+            time.sleep(0.5)
+
+        if self._visible_dialogs(self.driver, by):
+            raise BrowserAutomationError(
+                "A WhatsApp dialog from the previous contact is still blocking the page."
+            )
 
     def _start_browser(self) -> None:
         logger.info(
@@ -185,6 +309,8 @@ class WhatsAppWebSender:
         from selenium.webdriver.common.keys import Keys
         from selenium.webdriver.support.ui import WebDriverWait
 
+        self._clear_stale_dialogs(By, Keys)
+
         query = urlencode(
             {
                 "phone": contact.phone,
@@ -203,27 +329,79 @@ class WhatsAppWebSender:
                 f"The WhatsApp chat could not be opened: {exc}"
             ) from exc
 
-        invalid_phrases = (
-            "phone number shared via url is invalid",
-            "phone number isn't on whatsapp",
-            "phone number is not on whatsapp",
-        )
-
-        def composer_or_error(driver: object):
-            page_text = driver.find_element(By.TAG_NAME, "body").text.lower()  # type: ignore[attr-defined]
-            if any(phrase in page_text for phrase in invalid_phrases):
-                return "invalid"
+        def composer_dialog_or_error(driver: object):
+            dialogs = self._visible_dialogs(driver, By)
+            if dialogs:
+                return "dialog", dialogs[0]
             composers = driver.find_elements(  # type: ignore[attr-defined]
                 By.CSS_SELECTOR,
                 "footer div[contenteditable='true'][role='textbox']",
             )
-            return composers[-1] if composers else False
+            visible_composers = []
+            for composer in composers:
+                try:
+                    if composer.is_displayed():
+                        visible_composers.append(composer)
+                except WebDriverException:
+                    continue
+            if visible_composers:
+                return "composer", visible_composers[-1]
 
+            bodies = driver.find_elements(By.TAG_NAME, "body")  # type: ignore[attr-defined]
+            page_text = bodies[0].text if bodies else ""  # type: ignore[attr-defined]
+            return (
+                ("invalid", None)
+                if dialog_indicates_unavailable_contact(page_text)
+                else False
+            )
+
+        deadline = time.monotonic() + self.settings.chat_timeout_seconds
+        composer = None
         try:
-            result = WebDriverWait(
-                self.driver, self.settings.chat_timeout_seconds
-            ).until(composer_or_error)
+            for _attempt in range(4):
+                remaining = max(0.5, deadline - time.monotonic())
+                state, element = WebDriverWait(self.driver, remaining).until(
+                    composer_dialog_or_error
+                )
+                if state == "composer":
+                    composer = element
+                    break
+                if state == "invalid":
+                    raise BrowserAutomationError(
+                        "The number is not available on WhatsApp."
+                    )
+
+                dialog_text = self._dialog_text(element)
+                logger.info(
+                    "WhatsApp dialog for row %s: %s",
+                    contact.row_number,
+                    dialog_text or "<no text>",
+                )
+                unavailable = dialog_indicates_unavailable_contact(dialog_text)
+                dismissed = self._dismiss_dialog(element, By, Keys)
+                if unavailable:
+                    raise BrowserAutomationError(
+                        "The number is not available on WhatsApp."
+                    )
+                if not dismissed:
+                    summary = dialog_text or "unknown dialog"
+                    raise BrowserAutomationError(
+                        f"WhatsApp displayed a blocking dialog: {summary[:180]}"
+                    )
+                time.sleep(0.5)
         except TimeoutException as exc:
+            dialogs = self._visible_dialogs(self.driver, By)
+            if dialogs:
+                dialog_text = self._dialog_text(dialogs[0])
+                self._dismiss_dialog(dialogs[0], By, Keys)
+                if dialog_indicates_unavailable_contact(dialog_text):
+                    raise BrowserAutomationError(
+                        "The number is not available on WhatsApp."
+                    ) from exc
+                raise BrowserAutomationError(
+                    f"WhatsApp displayed a blocking dialog: "
+                    f"{(dialog_text or 'unknown dialog')[:180]}"
+                ) from exc
             logger.exception("Chat timed out for row %s", contact.row_number)
             raise BrowserAutomationError(
                 "Timed out while opening the chat. The number may be unavailable, "
@@ -232,19 +410,54 @@ class WhatsAppWebSender:
         except WebDriverException as exc:
             logger.exception("Chat stopped responding for row %s", contact.row_number)
             raise BrowserAutomationError(
-                f"WhatsApp Web stopped responding while opening the chat: {exc}"
+                "WhatsApp Web stopped responding while opening the chat: "
+                f"{summarize_browser_error(exc)}"
             ) from exc
 
-        if result == "invalid":
-            raise BrowserAutomationError("The number is not available on WhatsApp")
+        if composer is None:
+            raise BrowserAutomationError(
+                "The message composer did not become available after closing a dialog."
+            )
 
         # The URL has already filled the editor. Enter performs the explicit send.
         try:
-            result.click()
-            result.send_keys(Keys.ENTER)
+            composer_text = (composer.get_attribute("textContent") or "").strip()
+            if not composer_text:
+                raise BrowserAutomationError(
+                    "WhatsApp opened the chat but did not load the message text."
+                )
+            composer.send_keys(Keys.ENTER)
+
+            def message_was_sent(driver: object) -> bool:
+                dialogs = self._visible_dialogs(driver, By)
+                if dialogs:
+                    return False
+                try:
+                    return not (composer.get_attribute("textContent") or "").strip()
+                except WebDriverException:
+                    return True
+
+            WebDriverWait(self.driver, 10).until(message_was_sent)
+        except BrowserAutomationError:
+            raise
+        except TimeoutException as exc:
+            dialogs = self._visible_dialogs(self.driver, By)
+            if dialogs:
+                dialog_text = self._dialog_text(dialogs[0])
+                self._dismiss_dialog(dialogs[0], By, Keys)
+                raise BrowserAutomationError(
+                    f"WhatsApp blocked the send action: "
+                    f"{(dialog_text or 'unknown dialog')[:180]}"
+                ) from exc
+            raise BrowserAutomationError(
+                "WhatsApp did not confirm the send action; the message remained in "
+                "the composer."
+            ) from exc
         except WebDriverException as exc:
             logger.exception("Send action failed for row %s", contact.row_number)
-            raise BrowserAutomationError(f"The send action failed: {exc}") from exc
+            raise BrowserAutomationError(
+                f"The send action failed: {summarize_browser_error(exc)}"
+            ) from exc
 
     def _wait_between_messages(self, seconds: int) -> bool:
         remaining = seconds
@@ -254,9 +467,11 @@ class WhatsAppWebSender:
             while not self.run_event.is_set():
                 if self.stop_event.wait(0.25):
                     return False
-            self.on_log(
-                f"Next message in {remaining} second{'s' if remaining != 1 else ''}…"
-            )
+            if remaining == seconds or remaining <= 5 or remaining % 10 == 0:
+                self.on_log(
+                    f"Next message in {remaining} "
+                    f"second{'s' if remaining != 1 else ''}…"
+                )
             if self.stop_event.wait(1):
                 return False
             remaining -= 1
