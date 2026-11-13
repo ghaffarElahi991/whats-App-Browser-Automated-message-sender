@@ -9,9 +9,13 @@ from whatsapp_tool.sender import (
     SenderSettings,
     WhatsAppWebSender,
     build_chrome_environment,
+    contact_result_matches,
     dialog_indicates_unavailable_contact,
+    digits_only,
     normalize_dialog_text,
+    search_text_indicates_no_result,
     summarize_browser_error,
+    text_looks_like_contact_result,
 )
 
 
@@ -60,28 +64,20 @@ class FakeDialog:
         return [FakeButton(self.driver, "OK")]
 
 
-class FakeComposer:
-    def __init__(self) -> None:
-        self.content = "Hello"
-        self.sent = False
+class StaleButton(FakeButton):
+    def __init__(self, driver, _label: str) -> None:
+        self.driver = driver
 
-    def is_displayed(self) -> bool:
-        return True
+    @property
+    def text(self):
+        from selenium.common.exceptions import StaleElementReferenceException
 
-    def get_attribute(self, name: str):
-        return self.content if name == "textContent" else None
-
-    def send_keys(self, _keys) -> None:
-        self.content = ""
-        self.sent = True
-
-    def click(self) -> None:
-        raise AssertionError("The composer must not be clicked through an overlay")
+        raise StaleElementReferenceException("React replaced the button")
 
 
-class FakeBody:
-    def __init__(self, text: str = "") -> None:
-        self.text = text
+class StaleDialog(FakeDialog):
+    def find_elements(self, _by, _selector):
+        return [StaleButton(self.driver, "unused")]
 
 
 class FakeSwitchTo:
@@ -92,31 +88,47 @@ class FakeSwitchTo:
         return
 
 
+class DismissingSwitchTo(FakeSwitchTo):
+    def __init__(self, driver) -> None:
+        super().__init__()
+        self.driver = driver
+
+    def send_keys(self, _keys) -> None:
+        self.driver.dialog = None
+        self.driver.dismissed_dialogs += 1
+
+
 class FakeWhatsAppDriver:
-    def __init__(self, current_dialog: str | None = None) -> None:
-        self.current_dialog = current_dialog
+    def __init__(self) -> None:
         self.dialog = None
-        self.composer = FakeComposer()
         self.dismissed_dialogs = 0
         self.switch_to = FakeSwitchTo()
-
-    def get(self, _url: str) -> None:
-        if self.current_dialog:
-            self.dialog = FakeDialog(self, self.current_dialog)
-        else:
-            self.dialog = None
 
     def find_elements(self, _by, selector: str):
         if "role='dialog'" in selector:
             return [self.dialog] if self.dialog is not None else []
-        if selector == "footer div[contenteditable='true'][role='textbox']":
-            return [] if self.dialog is not None else [self.composer]
-        if selector == "body":
-            return [FakeBody()]
         return []
 
     def execute_script(self, _script: str, button: FakeButton) -> None:
         button.click()
+
+
+class FakeContactResult:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def is_displayed(self) -> bool:
+        return True
+
+
+class FakeResultDriver:
+    def __init__(self, list_items: list[FakeContactResult]) -> None:
+        self.list_items = list_items
+
+    def find_elements(self, _by, selector: str):
+        if selector == "div[role='listitem']":
+            return self.list_items
+        return []
 
 
 class SenderTests(unittest.TestCase):
@@ -157,31 +169,89 @@ class SenderTests(unittest.TestCase):
         error = RuntimeError("Message: element click intercepted\nStacktrace:\nlong")
         self.assertEqual(summarize_browser_error(error), "element click intercepted")
 
+    def test_phone_search_matches_formatted_result(self) -> None:
+        self.assertEqual(digits_only("+60 18-905 2999"), "60189052999")
+        self.assertTrue(
+            contact_result_matches("Workshop\n+60 18-905 2999", "60189052999")
+        )
+        self.assertFalse(contact_result_matches("+60 19-770 4052", "60189052999"))
+
+    def test_no_contact_search_result_is_recognized(self) -> None:
+        self.assertTrue(search_text_indicates_no_result("No contacts found"))
+        self.assertTrue(search_text_indicates_no_result("Invite to WhatsApp"))
+        self.assertFalse(search_text_indicates_no_result("Workshop +60 18-905 2999"))
+
+    def test_action_row_is_not_treated_as_contact(self) -> None:
+        self.assertFalse(text_looks_like_contact_result("New contact"))
+        self.assertFalse(text_looks_like_contact_result("Invite to WhatsApp"))
+        self.assertTrue(text_looks_like_contact_result("Saved workshop name"))
+
+    def test_single_saved_name_result_is_selected(self) -> None:
+        from selenium.webdriver.common.by import By
+
+        sender = self.make_sender()
+        result = FakeContactResult("Saved workshop name")
+        driver = FakeResultDriver([result])
+
+        self.assertIs(
+            sender._matching_contact_result(driver, By, "60189052999"), result
+        )
+
+    def test_multiple_name_only_results_are_not_guessed(self) -> None:
+        from selenium.webdriver.common.by import By
+
+        sender = self.make_sender()
+        driver = FakeResultDriver(
+            [FakeContactResult("Workshop one"), FakeContactResult("Workshop two")]
+        )
+
+        self.assertIsNone(sender._matching_contact_result(driver, By, "60189052999"))
+
     def test_stale_dialog_is_closed_before_next_contact(self) -> None:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.common.keys import Keys
+
         sender = self.make_sender()
         driver = FakeWhatsAppDriver()
         driver.dialog = FakeDialog(driver, "Previous number is not on WhatsApp")
         sender.driver = driver
 
         with patch("whatsapp_tool.sender.time.sleep", return_value=None):
-            sender._open_and_send(Contact(3, "+601", phone="60111111111"), "Hello")
+            sender._clear_stale_dialogs(By, Keys)
 
         self.assertEqual(driver.dismissed_dialogs, 1)
-        self.assertTrue(driver.composer.sent)
+        self.assertIsNone(driver.dialog)
 
-    def test_unavailable_dialog_is_closed_and_contact_fails_cleanly(self) -> None:
+    def test_unavailable_dialog_can_be_closed_cleanly(self) -> None:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.common.keys import Keys
+
         sender = self.make_sender()
-        driver = FakeWhatsAppDriver("This phone number isn't on WhatsApp")
+        driver = FakeWhatsAppDriver()
+        driver.dialog = FakeDialog(driver, "This phone number isn't on WhatsApp")
         sender.driver = driver
 
-        with (
-            patch("whatsapp_tool.sender.time.sleep", return_value=None),
-            self.assertRaisesRegex(BrowserAutomationError, "not available on WhatsApp"),
-        ):
-            sender._open_and_send(Contact(4, "+602", phone="60111111112"), "Hello")
+        self.assertTrue(
+            dialog_indicates_unavailable_contact(sender._dialog_text(driver.dialog))
+        )
+        self.assertTrue(sender._dismiss_dialog(driver.dialog, By, Keys))
 
         self.assertEqual(driver.dismissed_dialogs, 1)
-        self.assertFalse(driver.composer.sent)
+        self.assertIsNone(driver.dialog)
+
+    def test_rerendered_dialog_falls_back_to_escape(self) -> None:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.common.keys import Keys
+
+        sender = self.make_sender()
+        driver = FakeWhatsAppDriver()
+        driver.switch_to = DismissingSwitchTo(driver)
+        driver.dialog = StaleDialog(driver, "")
+        sender.driver = driver
+
+        self.assertTrue(sender._dismiss_dialog(driver.dialog, By, Keys))
+        self.assertEqual(driver.dismissed_dialogs, 1)
+        self.assertIsNone(driver.dialog)
 
     def test_chrome_environment_removes_snap_gtk_paths(self) -> None:
         original = {

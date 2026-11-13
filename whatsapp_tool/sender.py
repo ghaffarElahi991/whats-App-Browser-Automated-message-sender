@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlencode
 
 from .diagnostics import get_logger
 from .models import Contact, ContactState, SendResult
@@ -44,6 +44,51 @@ _SAFE_DIALOG_ACTIONS = (
     "dismiss",
     "continue to chat",
     "continue",
+)
+
+_NEW_CHAT_SELECTORS = (
+    "button[aria-label='New chat']",
+    "[role='button'][aria-label='New chat']",
+    "[title='New chat']",
+    "span[data-icon='new-chat-outline']",
+    "span[data-icon='new-chat']",
+)
+
+_SEARCH_BOX_SELECTORS = (
+    "input[role='textbox'][aria-label*='Search name' i]",
+    "input[role='textbox'][placeholder*='Search name' i]",
+    "div[contenteditable='true'][role='textbox'][aria-label*='Search name or number']",
+    "div[contenteditable='true'][role='textbox'][aria-placeholder*='Search name or number']",
+    "input[placeholder*='Search name or number']",
+    "[role='textbox'][aria-label*='number' i][data-tab='3']",
+    "[role='textbox'][placeholder*='number' i][data-tab='3']",
+)
+
+_GENERIC_SEARCH_BOX_SELECTOR = (
+    "input[role='textbox'][data-tab='3'], "
+    "div[contenteditable='true'][role='textbox'][data-tab='3']"
+)
+
+_CONTACT_RESULT_SELECTORS = (
+    "div[role='listitem']",
+    "div[data-testid='cell-frame-container']",
+    "div[role='button'][tabindex='0']",
+)
+
+_NO_RESULTS_PHRASES = (
+    "no contacts found",
+    "no results found",
+    "no chats, contacts or messages found",
+    "invite to whatsapp",
+)
+
+_NON_CONTACT_RESULT_PHRASES = (
+    "new group",
+    "new contact",
+    "new community",
+    "invite to whatsapp",
+    "no contacts found",
+    "no results found",
 )
 
 
@@ -84,6 +129,32 @@ def summarize_browser_error(error: BaseException, limit: int = 240) -> str:
     if summary.startswith("Message: "):
         summary = summary.removeprefix("Message: ")
     return summary if len(summary) <= limit else f"{summary[: limit - 1]}…"
+
+
+def digits_only(text: str) -> str:
+    return "".join(character for character in text if character.isdigit())
+
+
+def contact_result_matches(candidate_text: str, phone: str) -> bool:
+    candidate_digits = digits_only(candidate_text)
+    phone_digits = digits_only(phone)
+    return bool(phone_digits and phone_digits in candidate_digits)
+
+
+def search_text_indicates_no_result(text: str) -> bool:
+    normalized = normalize_dialog_text(text)
+    return any(phrase in normalized for phrase in _NO_RESULTS_PHRASES)
+
+
+def text_looks_like_contact_result(text: str) -> bool:
+    normalized = normalize_dialog_text(text)
+    return bool(
+        normalized
+        and not any(
+            phrase == normalized or normalized.startswith(f"{phrase} ")
+            for phrase in _NON_CONTACT_RESULT_PHRASES
+        )
+    )
 
 
 class BrowserAutomationError(RuntimeError):
@@ -168,8 +239,14 @@ class WhatsAppWebSender:
                 by.CSS_SELECTOR,
                 "button, [role='button']",  # type: ignore[attr-defined]
             )
-            for action in _SAFE_DIALOG_ACTIONS:
-                for button in buttons:
+        except WebDriverException:
+            # WhatsApp frequently replaces a transient dialog while it is being
+            # inspected. Escape still works against the newly rendered dialog.
+            buttons = []
+
+        for action in _SAFE_DIALOG_ACTIONS:
+            for button in buttons:
+                try:
                     label = normalize_dialog_text(
                         " ".join(
                             filter(
@@ -182,38 +259,60 @@ class WhatsAppWebSender:
                             )
                         )
                     )
-                    if label != action:
-                        continue
+                except WebDriverException:
+                    continue
+                if label != action:
+                    continue
+                try:
+                    button.click()  # type: ignore[attr-defined]
+                except WebDriverException:
                     try:
-                        button.click()  # type: ignore[attr-defined]
-                    except WebDriverException:
                         self.driver.execute_script("arguments[0].click();", button)
-                    return True
+                    except WebDriverException:
+                        continue
+                return True
 
+        try:
             active_element = self.driver.switch_to.active_element
             active_element.send_keys(keys.ESCAPE)  # type: ignore[attr-defined]
             return True
         except WebDriverException:
-            logger.exception("Could not dismiss a WhatsApp dialog")
-            return False
+            try:
+                body = self.driver.find_element(by.TAG_NAME, "body")
+                body.send_keys(keys.ESCAPE)
+                return True
+            except WebDriverException:
+                logger.exception("Could not dismiss a WhatsApp dialog")
+                return False
 
     def _clear_stale_dialogs(self, by: object, keys: object) -> None:
         assert self.driver is not None
-        for _attempt in range(3):
+        for _attempt in range(5):
             dialogs = self._visible_dialogs(self.driver, by)
             if not dialogs:
                 return
             text = self._dialog_text(dialogs[0])
             logger.info("Dismissing stale WhatsApp dialog: %s", text or "<no text>")
-            if not self._dismiss_dialog(dialogs[0], by, keys):
-                raise BrowserAutomationError(
-                    "A WhatsApp dialog from the previous contact could not be closed."
-                )
+            if not text:
+                # Empty accessibility dialogs are commonly transient loading
+                # overlays. Let React finish replacing/removing them first.
+                time.sleep(0.5)
+                dialogs = self._visible_dialogs(self.driver, by)
+                if not dialogs:
+                    return
+            self._dismiss_dialog(dialogs[0], by, keys)
             time.sleep(0.5)
 
-        if self._visible_dialogs(self.driver, by):
+        remaining = self._visible_dialogs(self.driver, by)
+        if remaining:
+            dialog_text = self._dialog_text(remaining[0])
+            logger.warning(
+                "WhatsApp dialog remained after cleanup: %s",
+                dialog_text or "<no text>",
+            )
             raise BrowserAutomationError(
-                "A WhatsApp dialog from the previous contact is still blocking the page."
+                "A WhatsApp popup is blocking the page and could not be closed"
+                + (f": {dialog_text[:180]}" if dialog_text else ".")
             )
 
     def _start_browser(self) -> None:
@@ -302,74 +401,329 @@ class WhatsAppWebSender:
             ) from exc
         self.on_log("WhatsApp Web is ready.")
 
-    def _open_and_send(self, contact: Contact, message: str) -> None:
+    @staticmethod
+    def _is_visible(element: object) -> bool:
+        try:
+            return bool(element.is_displayed())  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - WhatsApp frequently rerenders its DOM
+            return False
+
+    def _click_element(self, element: object, by: object) -> None:
+        assert self.driver is not None
+        from selenium.common.exceptions import WebDriverException
+
+        target = element
+        try:
+            role = element.get_attribute("role")  # type: ignore[attr-defined]
+            tag_name = str(element.tag_name).lower()  # type: ignore[attr-defined]
+            if role != "button" and tag_name != "button":
+                ancestors = element.find_elements(  # type: ignore[attr-defined]
+                    by.XPATH,
+                    "./ancestor::*[@role='button' or self::button][1]",  # type: ignore[attr-defined]
+                )
+                if ancestors:
+                    target = ancestors[0]
+            target.click()  # type: ignore[attr-defined]
+        except WebDriverException:
+            self.driver.execute_script("arguments[0].click();", target)
+
+    def _find_visible_by_selectors(
+        self, driver: object, by: object, selectors: tuple[str, ...]
+    ) -> object | None:
+        for selector in selectors:
+            elements = driver.find_elements(  # type: ignore[attr-defined]
+                by.CSS_SELECTOR,
+                selector,  # type: ignore[attr-defined]
+            )
+            for element in elements:
+                if self._is_visible(element):
+                    return element
+        return None
+
+    def _find_new_chat_search_box(
+        self, driver: object, by: object, existing_element_ids: set[str]
+    ) -> object | None:
+        search_box = self._find_visible_by_selectors(driver, by, _SEARCH_BOX_SELECTORS)
+        if search_box is not None:
+            return search_box
+
+        # Language-independent fallback: after New chat is clicked, WhatsApp
+        # adds a second data-tab=3 textbox. Prefer the newly created element and
+        # never choose a footer message composer.
+        candidates = driver.find_elements(  # type: ignore[attr-defined]
+            by.CSS_SELECTOR,
+            _GENERIC_SEARCH_BOX_SELECTOR,  # type: ignore[attr-defined]
+        )
+        fallback = None
+        for candidate in candidates:
+            if not self._is_visible(candidate):
+                continue
+            try:
+                if candidate.find_elements(  # type: ignore[attr-defined]
+                    by.XPATH,
+                    "./ancestor::footer[1]",  # type: ignore[attr-defined]
+                ):
+                    continue
+                element_id = str(candidate.id)  # type: ignore[attr-defined]
+                label = normalize_dialog_text(
+                    " ".join(
+                        filter(
+                            None,
+                            (
+                                candidate.get_attribute("aria-label"),  # type: ignore[attr-defined]
+                                candidate.get_attribute("placeholder"),  # type: ignore[attr-defined]
+                            ),
+                        )
+                    )
+                )
+            except Exception:  # noqa: BLE001 - stale textboxes are ignored
+                continue
+            if "start a new chat" in label:
+                fallback = fallback or candidate
+                continue
+            if element_id not in existing_element_ids:
+                return candidate
+            fallback = fallback or candidate
+        return fallback
+
+    def _log_visible_textboxes(self, driver: object, by: object) -> None:
+        descriptions = []
+        elements = driver.find_elements(  # type: ignore[attr-defined]
+            by.CSS_SELECTOR,
+            "input[role='textbox'], [contenteditable='true'][role='textbox']",  # type: ignore[attr-defined]
+        )
+        for element in elements:
+            if not self._is_visible(element):
+                continue
+            try:
+                attributes = {
+                    name: element.get_attribute(name)  # type: ignore[attr-defined]
+                    for name in (
+                        "aria-label",
+                        "aria-placeholder",
+                        "placeholder",
+                        "data-tab",
+                    )
+                    if element.get_attribute(name)  # type: ignore[attr-defined]
+                }
+            except Exception:  # noqa: BLE001 - diagnostic only
+                continue
+            descriptions.append(attributes)
+        logger.warning("Visible WhatsApp textboxes: %s", descriptions or "none")
+
+    def _open_new_chat_search(self, by: object, keys: object, wait: object) -> object:
         assert self.driver is not None
         from selenium.common.exceptions import TimeoutException, WebDriverException
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.common.keys import Keys
-        from selenium.webdriver.support.ui import WebDriverWait
 
-        self._clear_stale_dialogs(By, Keys)
+        self._clear_stale_dialogs(by, keys)
 
-        query = urlencode(
-            {
-                "phone": contact.phone,
-                "text": message,
-                "type": "phone_number",
-                "app_absent": "0",
-            }
-        )
+        existing_element_ids = set()
+        for element in self.driver.find_elements(  # type: ignore[attr-defined]
+            by.CSS_SELECTOR,
+            _GENERIC_SEARCH_BOX_SELECTOR,  # type: ignore[attr-defined]
+        ):
+            if self._is_visible(element):
+                try:
+                    existing_element_ids.add(str(element.id))  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 - stale textboxes are ignored
+                    pass
+
+        button = self._find_visible_by_selectors(self.driver, by, _NEW_CHAT_SELECTORS)
+        if button is None:
+            try:
+                self.driver.switch_to.active_element.send_keys(keys.ESCAPE)
+                time.sleep(0.3)
+            except WebDriverException:
+                pass
+
+        stage = "button"
         try:
-            self.driver.get(f"https://web.whatsapp.com/send?{query}")
-        except WebDriverException as exc:
-            logger.exception(
-                "Opening WhatsApp chat failed for row %s", contact.row_number
+            button = wait(self.driver, 15).until(
+                lambda driver: self._find_visible_by_selectors(
+                    driver, by, _NEW_CHAT_SELECTORS
+                )
             )
+            self._click_element(button, by)
+            stage = "search"
+            search_box = wait(self.driver, 15).until(
+                lambda driver: self._find_new_chat_search_box(
+                    driver, by, existing_element_ids
+                )
+            )
+            self._click_element(search_box, by)
+            try:
+                search_box.clear()  # type: ignore[attr-defined]
+            except WebDriverException:
+                modifier = keys.COMMAND if sys.platform == "darwin" else keys.CONTROL
+                search_box.send_keys(modifier, "a")  # type: ignore[attr-defined]
+                search_box.send_keys(keys.BACKSPACE)  # type: ignore[attr-defined]
+            return search_box
+        except TimeoutException as exc:
+            if stage == "search":
+                self._log_visible_textboxes(self.driver, by)
+                raise BrowserAutomationError(
+                    "New chat opened, but its number search field was not found."
+                ) from exc
             raise BrowserAutomationError(
-                f"The WhatsApp chat could not be opened: {exc}"
+                "WhatsApp's New chat (+) button was not found."
+            ) from exc
+        except WebDriverException as exc:
+            raise BrowserAutomationError(
+                f"Could not use the New chat search: {summarize_browser_error(exc)}"
             ) from exc
 
+    def _matching_contact_result(
+        self, driver: object, by: object, phone: str
+    ) -> object | None:
+        # Exact number searches can return a saved contact whose row exposes
+        # only the saved name. A sole visible listitem is safe as a fallback;
+        # multiple name-only rows remain ambiguous and are never guessed.
+        list_items: list[tuple[str, object]] = []
+        for element in driver.find_elements(  # type: ignore[attr-defined]
+            by.CSS_SELECTOR,
+            _CONTACT_RESULT_SELECTORS[0],  # type: ignore[attr-defined]
+        ):
+            if not self._is_visible(element):
+                continue
+            try:
+                text = str(element.text)  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 - stale search result
+                continue
+            if contact_result_matches(text, phone):
+                return element
+            if text_looks_like_contact_result(text):
+                list_items.append((text, element))
+
+        if len(list_items) == 1:
+            logger.info(
+                "Using the sole visible contact result; WhatsApp displayed its "
+                "saved name instead of the searched number"
+            )
+            return list_items[0][1]
+
+        for selector in _CONTACT_RESULT_SELECTORS[1:]:
+            matches: list[tuple[int, object]] = []
+            elements = driver.find_elements(  # type: ignore[attr-defined]
+                by.CSS_SELECTOR,
+                selector,  # type: ignore[attr-defined]
+            )
+            for element in elements:
+                if not self._is_visible(element):
+                    continue
+                try:
+                    text = str(element.text)  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 - stale search result
+                    continue
+                if contact_result_matches(text, phone):
+                    matches.append((len(text), element))
+            if matches:
+                return min(matches, key=lambda item: item[0])[1]
+        return None
+
+    def _select_contact_from_search(
+        self,
+        contact: Contact,
+        by: object,
+        keys: object,
+        wait: object,
+    ) -> None:
+        assert self.driver is not None
+        from selenium.common.exceptions import TimeoutException, WebDriverException
+
+        self.on_log(f"Searching WhatsApp for row {contact.row_number}…")
+        search_box = self._open_new_chat_search(by, keys, wait)
+        try:
+            search_box.send_keys(f"+{contact.phone}")  # type: ignore[attr-defined]
+            self.on_log("Waiting 2 seconds for contact results…")
+            time.sleep(2)
+
+            def result_dialog_or_empty(driver: object):
+                dialogs = self._visible_dialogs(driver, by)
+                if dialogs:
+                    return "dialog", dialogs[0]
+                result = self._matching_contact_result(driver, by, contact.phone)
+                if result is not None:
+                    return "result", result
+                bodies = driver.find_elements(by.TAG_NAME, "body")  # type: ignore[attr-defined]
+                body_text = bodies[0].text if bodies else ""  # type: ignore[attr-defined]
+                return (
+                    ("unavailable", None)
+                    if search_text_indicates_no_result(body_text)
+                    else False
+                )
+
+            state, element = wait(
+                self.driver, self.settings.chat_timeout_seconds
+            ).until(result_dialog_or_empty)
+            if state == "unavailable":
+                raise BrowserAutomationError(
+                    "The number was not found in WhatsApp's New chat search."
+                )
+            if state == "dialog":
+                dialog_text = self._dialog_text(element)
+                self._dismiss_dialog(element, by, keys)
+                raise BrowserAutomationError(
+                    "WhatsApp blocked the contact search: "
+                    f"{(dialog_text or 'unknown dialog')[:180]}"
+                )
+            self._click_element(element, by)
+        except BrowserAutomationError:
+            try:
+                search_box.send_keys(keys.ESCAPE)  # type: ignore[attr-defined]
+            except WebDriverException:
+                pass
+            raise
+        except TimeoutException as exc:
+            visible_list_items = [
+                element
+                for element in self.driver.find_elements(  # type: ignore[attr-defined]
+                    by.CSS_SELECTOR,
+                    _CONTACT_RESULT_SELECTORS[0],  # type: ignore[attr-defined]
+                )
+                if self._is_visible(element)
+            ]
+            logger.warning(
+                "Contact result timeout: visible listitem count=%s",
+                len(visible_list_items),
+            )
+            try:
+                search_box.send_keys(keys.ESCAPE)  # type: ignore[attr-defined]
+            except WebDriverException:
+                pass
+            raise BrowserAutomationError(
+                "No matching WhatsApp contact appeared after searching the number."
+            ) from exc
+        except WebDriverException as exc:
+            raise BrowserAutomationError(
+                f"The contact search failed: {summarize_browser_error(exc)}"
+            ) from exc
+
+    def _wait_for_message_composer(
+        self, contact: Contact, by: object, keys: object, wait: object
+    ) -> object:
+        assert self.driver is not None
+        from selenium.common.exceptions import TimeoutException, WebDriverException
+
         def composer_dialog_or_error(driver: object):
-            dialogs = self._visible_dialogs(driver, By)
+            dialogs = self._visible_dialogs(driver, by)
             if dialogs:
                 return "dialog", dialogs[0]
             composers = driver.find_elements(  # type: ignore[attr-defined]
-                By.CSS_SELECTOR,
-                "footer div[contenteditable='true'][role='textbox']",
+                by.CSS_SELECTOR,
+                "footer div[contenteditable='true'][role='textbox']",  # type: ignore[attr-defined]
             )
-            visible_composers = []
-            for composer in composers:
-                try:
-                    if composer.is_displayed():
-                        visible_composers.append(composer)
-                except WebDriverException:
-                    continue
-            if visible_composers:
-                return "composer", visible_composers[-1]
-
-            bodies = driver.find_elements(By.TAG_NAME, "body")  # type: ignore[attr-defined]
-            page_text = bodies[0].text if bodies else ""  # type: ignore[attr-defined]
-            return (
-                ("invalid", None)
-                if dialog_indicates_unavailable_contact(page_text)
-                else False
-            )
+            visible = [element for element in composers if self._is_visible(element)]
+            return ("composer", visible[-1]) if visible else False
 
         deadline = time.monotonic() + self.settings.chat_timeout_seconds
-        composer = None
         try:
             for _attempt in range(4):
                 remaining = max(0.5, deadline - time.monotonic())
-                state, element = WebDriverWait(self.driver, remaining).until(
+                state, element = wait(self.driver, remaining).until(
                     composer_dialog_or_error
                 )
                 if state == "composer":
-                    composer = element
-                    break
-                if state == "invalid":
-                    raise BrowserAutomationError(
-                        "The number is not available on WhatsApp."
-                    )
+                    return element
 
                 dialog_text = self._dialog_text(element)
                 logger.info(
@@ -378,75 +732,79 @@ class WhatsAppWebSender:
                     dialog_text or "<no text>",
                 )
                 unavailable = dialog_indicates_unavailable_contact(dialog_text)
-                dismissed = self._dismiss_dialog(element, By, Keys)
+                dismissed = self._dismiss_dialog(element, by, keys)
                 if unavailable:
                     raise BrowserAutomationError(
                         "The number is not available on WhatsApp."
                     )
                 if not dismissed:
-                    summary = dialog_text or "unknown dialog"
                     raise BrowserAutomationError(
-                        f"WhatsApp displayed a blocking dialog: {summary[:180]}"
+                        "WhatsApp displayed a blocking dialog: "
+                        f"{(dialog_text or 'unknown dialog')[:180]}"
                     )
                 time.sleep(0.5)
         except TimeoutException as exc:
-            dialogs = self._visible_dialogs(self.driver, By)
-            if dialogs:
-                dialog_text = self._dialog_text(dialogs[0])
-                self._dismiss_dialog(dialogs[0], By, Keys)
-                if dialog_indicates_unavailable_contact(dialog_text):
-                    raise BrowserAutomationError(
-                        "The number is not available on WhatsApp."
-                    ) from exc
-                raise BrowserAutomationError(
-                    f"WhatsApp displayed a blocking dialog: "
-                    f"{(dialog_text or 'unknown dialog')[:180]}"
-                ) from exc
-            logger.exception("Chat timed out for row %s", contact.row_number)
             raise BrowserAutomationError(
-                "Timed out while opening the chat. The number may be unavailable, "
-                "or WhatsApp Web may have changed."
+                "The contact was selected, but the message composer did not open."
             ) from exc
         except WebDriverException as exc:
-            logger.exception("Chat stopped responding for row %s", contact.row_number)
             raise BrowserAutomationError(
-                "WhatsApp Web stopped responding while opening the chat: "
+                "WhatsApp stopped responding while opening the selected contact: "
                 f"{summarize_browser_error(exc)}"
             ) from exc
 
-        if composer is None:
-            raise BrowserAutomationError(
-                "The message composer did not become available after closing a dialog."
-            )
+        raise BrowserAutomationError("The message composer did not become available.")
 
-        # The URL has already filled the editor. Enter performs the explicit send.
+    def _type_and_send_message(
+        self,
+        contact: Contact,
+        message: str,
+        composer: object,
+        by: object,
+        keys: object,
+        wait: object,
+    ) -> None:
+        assert self.driver is not None
+        from selenium.common.exceptions import TimeoutException, WebDriverException
+        from selenium.webdriver.common.action_chains import ActionChains
+
         try:
-            composer_text = (composer.get_attribute("textContent") or "").strip()
+            self._clear_stale_dialogs(by, keys)
+            composer.click()  # type: ignore[attr-defined]
+            lines = message.split("\n")
+            for index, line in enumerate(lines):
+                if line:
+                    composer.send_keys(line)  # type: ignore[attr-defined]
+                if index < len(lines) - 1:
+                    ActionChains(self.driver).key_down(keys.SHIFT).send_keys(
+                        keys.ENTER
+                    ).key_up(keys.SHIFT).perform()
+
+            composer_text = (composer.get_attribute("textContent") or "").strip()  # type: ignore[attr-defined]
             if not composer_text:
                 raise BrowserAutomationError(
-                    "WhatsApp opened the chat but did not load the message text."
+                    "WhatsApp opened the chat but did not accept the message text."
                 )
-            composer.send_keys(Keys.ENTER)
+            composer.send_keys(keys.ENTER)  # type: ignore[attr-defined]
 
             def message_was_sent(driver: object) -> bool:
-                dialogs = self._visible_dialogs(driver, By)
-                if dialogs:
+                if self._visible_dialogs(driver, by):
                     return False
                 try:
-                    return not (composer.get_attribute("textContent") or "").strip()
+                    return not (composer.get_attribute("textContent") or "").strip()  # type: ignore[attr-defined]
                 except WebDriverException:
                     return True
 
-            WebDriverWait(self.driver, 10).until(message_was_sent)
+            wait(self.driver, 10).until(message_was_sent)
         except BrowserAutomationError:
             raise
         except TimeoutException as exc:
-            dialogs = self._visible_dialogs(self.driver, By)
+            dialogs = self._visible_dialogs(self.driver, by)
             if dialogs:
                 dialog_text = self._dialog_text(dialogs[0])
-                self._dismiss_dialog(dialogs[0], By, Keys)
+                self._dismiss_dialog(dialogs[0], by, keys)
                 raise BrowserAutomationError(
-                    f"WhatsApp blocked the send action: "
+                    "WhatsApp blocked the send action: "
                     f"{(dialog_text or 'unknown dialog')[:180]}"
                 ) from exc
             raise BrowserAutomationError(
@@ -458,6 +816,16 @@ class WhatsAppWebSender:
             raise BrowserAutomationError(
                 f"The send action failed: {summarize_browser_error(exc)}"
             ) from exc
+
+    def _open_and_send(self, contact: Contact, message: str) -> None:
+        assert self.driver is not None
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.common.keys import Keys
+        from selenium.webdriver.support.ui import WebDriverWait
+
+        self._select_contact_from_search(contact, By, Keys, WebDriverWait)
+        composer = self._wait_for_message_composer(contact, By, Keys, WebDriverWait)
+        self._type_and_send_message(contact, message, composer, By, Keys, WebDriverWait)
 
     def _wait_between_messages(self, seconds: int) -> bool:
         remaining = seconds
@@ -506,7 +874,7 @@ class WhatsAppWebSender:
                     break
 
                 self.on_status(
-                    SendResult(contact, ContactState.SENDING, "Opening chat")
+                    SendResult(contact, ContactState.SENDING, "Searching number")
                 )
                 personalized = render_message(
                     message_template,

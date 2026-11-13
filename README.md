@@ -87,7 +87,8 @@ The launcher keeps macOS, Windows, and Linux virtual environments separate, so t
 4. Keep the default 30-second interval or choose 15–300 seconds.
 5. Confirm that every recipient opted in and press **Start sending**.
 6. Chrome opens. Scan the WhatsApp Web QR code on the first run. The dedicated Chrome session folder preserves login for later runs.
-7. Pause or stop from the desktop UI. Export a CSV report when finished.
+7. For each ready row, the sender clicks **New chat (+)**, searches for the full international number, waits 2 seconds for WhatsApp's results, selects the matching number, and then types and sends the message.
+8. Pause or stop from the desktop UI. Export a CSV report when finished.
 
 Do not open the same dedicated Chrome session folder in another Chrome process while the sender is running.
 
