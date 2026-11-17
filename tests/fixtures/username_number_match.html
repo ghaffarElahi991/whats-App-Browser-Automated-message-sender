@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Local username search regression fixture</title>
+<body>
+<section id="new-chat">
+  <h1>New chat</h1>
+  <input id="number-search" role="textbox" data-tab="3"
+         aria-label="Search name, number or @username" value="+60123456789">
+  <p>Not in your contacts</p>
+  <!-- Intentionally no listitem, button role, or WhatsApp test id. -->
+  <div id="contact-result">
+    <div id="contact-name-area">
+      <span id="username-target">@ExampleWorkshop</span>
+      <span>Matches <span>this number</span></span>
+    </div>
+    <button id="add-contact" aria-label="Add contact">+</button>
+  </div>
+</section>
+<!-- Background controls must not be mistaken for the search result/new chat. -->
+<div id="pane-side"><div role="listitem">Unrelated contact</div></div>
+<main id="main"><footer>
+  <div id="old-composer" role="textbox" contenteditable="true"></div>
+</footer></main>
+<script>
+window.contactClicks = 0;
+window.addClicks = 0;
+document.getElementById('add-contact').onclick = event => {
+  event.stopPropagation(); window.addClicks++;
+};
+document.getElementById('contact-result').onclick = () => {
+  window.contactClicks++;
+  document.getElementById('new-chat').hidden = true;
+  document.getElementById('old-composer').id = 'selected-composer';
+};
+</script>
+</body>
+</html>

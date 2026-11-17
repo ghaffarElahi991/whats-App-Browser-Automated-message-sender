@@ -87,7 +87,7 @@ The launcher keeps macOS, Windows, and Linux virtual environments separate, so t
 4. Keep the default 30-second interval or choose 15–300 seconds.
 5. Confirm that every recipient opted in and press **Start sending**.
 6. Chrome opens. Scan the WhatsApp Web QR code on the first run. The dedicated Chrome session folder preserves login for later runs.
-7. For each ready row, the sender clicks **New chat (+)**, searches for the full international number, waits 2 seconds for WhatsApp's results, selects the matching number, and then types and sends the message.
+7. For each ready row, the sender clicks **New chat (+)**, searches for the full international number, waits 2 seconds for WhatsApp's results, and selects the matching contact. When a username appears with **Matches this number**, it clicks the username area, avoiding the add-contact icon. It waits for New chat to close before typing the message and clicking **Send**.
 8. Pause or stop from the desktop UI. Export a CSV report when finished.
 
 Do not open the same dedicated Chrome session folder in another Chrome process while the sender is running.
@@ -108,7 +108,7 @@ If Chrome does not open, close any Chrome process already using the sender's ded
 
 On Linux, the sender isolates system Chrome from GTK/GSettings paths inherited from Snap-packaged editors such as VS Code. Those mixed paths can otherwise make visible Chrome exit during startup with `session not created` even though headless Chrome works.
 
-If a phone number is unavailable, WhatsApp may display a modal dialog. The sender closes that dialog, marks only that spreadsheet row as failed, and continues with the next contact. If WhatsApp refreshes the message box while typing, the sender reacquires it and safely rebuilds the draft. It verifies the complete draft before pressing Enter and confirms that the composer clears before recording a row as sent.
+If a phone number is unavailable, WhatsApp may display a modal dialog. The sender closes that dialog, marks only that spreadsheet row as failed, and continues with the next contact. If WhatsApp refreshes the message box while typing, the sender reacquires it and safely rebuilds the draft. It verifies the complete draft before clicking Send and confirms that the composer clears before recording a row as sent. Username-bearing results are supported without recording usernames in diagnostic logs.
 
 ## Excel notes
 

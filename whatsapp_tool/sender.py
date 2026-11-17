@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 import time
@@ -71,6 +72,14 @@ _GENERIC_SEARCH_BOX_SELECTOR = (
 
 _MESSAGE_COMPOSER_SELECTOR = "footer div[contenteditable='true'][role='textbox']"
 
+_SEND_BUTTON_SELECTORS = (
+    "button[aria-label='Send']",
+    "[role='button'][aria-label='Send']",
+    "button[data-testid='compose-btn-send']",
+    "[data-testid='compose-btn-send']",
+    "span[data-icon='send']",
+)
+
 _CONTACT_RESULT_SELECTORS = (
     "div[role='listitem']",
     "div[data-testid='cell-frame-container']",
@@ -91,6 +100,18 @@ _NON_CONTACT_RESULT_PHRASES = (
     "invite to whatsapp",
     "no contacts found",
     "no results found",
+)
+
+_USERNAME_PATTERN = re.compile(r"(?<![\w@])@[a-z0-9._]{3,35}\b", re.IGNORECASE)
+
+# This unsaved-contact layout need not have role=listitem or a cell-frame testid.
+_NUMBER_MATCH_LABEL_XPATH = (
+    ".//*[normalize-space(.)='Matches this number' "
+    "and not(*[normalize-space(.)='Matches this number'])]"
+)
+_USERNAME_NAME_XPATH = (
+    ".//*[starts-with(normalize-space(.), '@') "
+    "and not(*[starts-with(normalize-space(.), '@')])]"
 )
 
 
@@ -157,6 +178,10 @@ def text_looks_like_contact_result(text: str) -> bool:
             for phrase in _NON_CONTACT_RESULT_PHRASES
         )
     )
+
+
+def text_contains_whatsapp_username(text: str) -> bool:
+    return bool(_USERNAME_PATTERN.search(text))
 
 
 def normalize_composer_text(text: str) -> str:
@@ -424,7 +449,10 @@ class WhatsAppWebSender:
 
     def _click_element(self, element: object, by: object) -> None:
         assert self.driver is not None
-        from selenium.common.exceptions import WebDriverException
+        from selenium.common.exceptions import (
+            StaleElementReferenceException,
+            WebDriverException,
+        )
 
         target = element
         try:
@@ -438,6 +466,8 @@ class WhatsAppWebSender:
                 if ancestors:
                     target = ancestors[0]
             target.click()  # type: ignore[attr-defined]
+        except StaleElementReferenceException:
+            raise
         except WebDriverException:
             self.driver.execute_script("arguments[0].click();", target)
 
@@ -586,9 +616,68 @@ class WhatsAppWebSender:
                 f"Could not use the New chat search: {summarize_browser_error(exc)}"
             ) from exc
 
+    def _number_matched_username_result(
+        self, search_box: object, by: object
+    ) -> tuple[bool, object | None]:
+        """Return the name target for the explicit 'Matches this number' row.
+
+        Work outward from the active New chat input to keep background chats
+        out of the search. Return handled=True even for an ambiguous match so
+        the caller cannot fall back to an unrelated result.
+        """
+        panels = search_box.find_elements(  # type: ignore[attr-defined]
+            by.XPATH,
+            "./ancestor::*[not(self::body or self::html) and "
+            + _NUMBER_MATCH_LABEL_XPATH
+            + "][1]",
+        )
+        if not panels:
+            return False, None
+        panel = panels[0]
+        if panel.find_elements(by.CSS_SELECTOR, "#pane-side, #main, footer"):
+            return False, None
+        labels = [
+            label
+            for label in panel.find_elements(by.XPATH, _NUMBER_MATCH_LABEL_XPATH)
+            if self._is_visible(label)
+        ]
+        if not labels:
+            return False, None
+        if len(labels) != 1:
+            return True, None
+
+        # The first ancestor containing the username and subtitle is the name
+        # area. Click the username itself so a sibling Add contact icon is never
+        # chosen, even if the outer row has no conventional button role.
+        ancestors = labels[0].find_elements(by.XPATH, "./ancestor::*")
+        for ancestor in reversed(ancestors):
+            if ancestor == panel:
+                break
+            names = [
+                name
+                for name in ancestor.find_elements(by.XPATH, _USERNAME_NAME_XPATH)
+                if self._is_visible(name)
+                and text_contains_whatsapp_username(str(name.text))
+            ]
+            if names:
+                return True, names[0] if len(names) == 1 else None
+        return True, None
+
     def _matching_contact_result(
-        self, driver: object, by: object, phone: str
+        self, driver: object, by: object, phone: str, search_box: object | None = None
     ) -> object | None:
+        if search_box is not None:
+            query = search_box.get_attribute("value")  # type: ignore[attr-defined]
+            if query is None:
+                query = search_box.get_attribute("textContent")  # type: ignore[attr-defined]
+            if digits_only(str(query or "")) != digits_only(phone):
+                return None
+            handled, target = self._number_matched_username_result(search_box, by)
+            if handled:
+                if target is not None:
+                    self.on_log("Found username result marked 'Matches this number'.")
+                return target
+
         # Exact number searches can return a saved contact whose row exposes
         # only the saved name. A sole visible listitem is safe as a fallback;
         # multiple name-only rows remain ambiguous and are never guessed.
@@ -598,6 +687,10 @@ class WhatsAppWebSender:
             _CONTACT_RESULT_SELECTORS[0],  # type: ignore[attr-defined]
         ):
             if not self._is_visible(element):
+                continue
+            if search_box is not None and element.find_elements(
+                by.XPATH, "./ancestor::*[@id='pane-side' or @id='main' or self::footer]"
+            ):
                 continue
             try:
                 text = str(element.text)  # type: ignore[attr-defined]
@@ -624,6 +717,11 @@ class WhatsAppWebSender:
             for element in elements:
                 if not self._is_visible(element):
                     continue
+                if search_box is not None and element.find_elements(
+                    by.XPATH,
+                    "./ancestor::*[@id='pane-side' or @id='main' or self::footer]",
+                ):
+                    continue
                 try:
                     text = str(element.text)  # type: ignore[attr-defined]
                 except Exception:  # noqa: BLE001 - stale search result
@@ -642,7 +740,11 @@ class WhatsAppWebSender:
         wait: object,
     ) -> None:
         assert self.driver is not None
-        from selenium.common.exceptions import TimeoutException, WebDriverException
+        from selenium.common.exceptions import (
+            StaleElementReferenceException,
+            TimeoutException,
+            WebDriverException,
+        )
 
         self.on_log(f"Searching WhatsApp for row {contact.row_number}…")
         search_box = self._open_new_chat_search(by, keys, wait)
@@ -655,9 +757,22 @@ class WhatsAppWebSender:
                 dialogs = self._visible_dialogs(driver, by)
                 if dialogs:
                     return "dialog", dialogs[0]
-                result = self._matching_contact_result(driver, by, contact.phone)
-                if result is not None:
-                    return "result", result
+                # Reacquire the search input/results if React replaced them.
+                nonlocal search_box
+                try:
+                    current_search = self._find_visible_by_selectors(
+                        driver, by, _SEARCH_BOX_SELECTORS
+                    )
+                    if current_search is not None:
+                        search_box = current_search
+                    result = self._matching_contact_result(
+                        driver, by, contact.phone, search_box
+                    )
+                    if result is not None:
+                        result.click()
+                        return "selected", result
+                except StaleElementReferenceException:
+                    return False
                 bodies = driver.find_elements(by.TAG_NAME, "body")  # type: ignore[attr-defined]
                 body_text = bodies[0].text if bodies else ""  # type: ignore[attr-defined]
                 return (
@@ -680,7 +795,27 @@ class WhatsAppWebSender:
                     "WhatsApp blocked the contact search: "
                     f"{(dialog_text or 'unknown dialog')[:180]}"
                 )
-            self._click_element(element, by)
+            self.on_log("Contact result clicked; waiting for its chat to open…")
+
+            def search_closed(driver: object) -> bool:
+                if self._visible_dialogs(driver, by):
+                    return False
+                return (
+                    not self._is_visible(search_box)
+                    and self._find_visible_by_selectors(
+                        driver, by, _SEARCH_BOX_SELECTORS
+                    )
+                    is None
+                )
+
+            try:
+                wait(self.driver, 10).until(search_closed)
+            except TimeoutException as exc:
+                raise BrowserAutomationError(
+                    "The contact result was clicked, but New chat is still open. "
+                    "No message was typed."
+                ) from exc
+            self.on_log("Selected contact chat opened.")
         except BrowserAutomationError:
             try:
                 search_box.send_keys(keys.ESCAPE)  # type: ignore[attr-defined]
@@ -697,8 +832,19 @@ class WhatsAppWebSender:
                 if self._is_visible(element)
             ]
             logger.warning(
-                "Contact result timeout: visible listitem count=%s",
+                "Contact result timeout: visible listitems=%s, username_items=%s, "
+                "items_showing_number=%s",
                 len(visible_list_items),
+                sum(
+                    1
+                    for element in visible_list_items
+                    if text_contains_whatsapp_username(self._dialog_text(element))
+                ),
+                sum(
+                    1
+                    for element in visible_list_items
+                    if contact_result_matches(self._dialog_text(element), contact.phone)
+                ),
             )
             try:
                 search_box.send_keys(keys.ESCAPE)  # type: ignore[attr-defined]
@@ -786,6 +932,23 @@ class WhatsAppWebSender:
             lambda driver: self._visible_message_composer(driver, by) or False
         )
 
+    def _fresh_send_button(self, by: object, wait: object, timeout: float = 5):
+        assert self.driver is not None
+        from selenium.common.exceptions import TimeoutException
+
+        try:
+            return wait(self.driver, timeout).until(
+                lambda driver: (
+                    self._find_visible_by_selectors(driver, by, _SEND_BUTTON_SELECTORS)
+                    or False
+                )
+            )
+        except TimeoutException as exc:
+            raise BrowserAutomationError(
+                "The complete message is in the composer, but WhatsApp's Send "
+                "button was not found; the message was not sent."
+            ) from exc
+
     def _prepare_message_draft(
         self,
         contact: Contact,
@@ -849,23 +1012,22 @@ class WhatsAppWebSender:
         contact: Contact,
         message: str,
         by: object,
-        keys: object,
         wait: object,
     ) -> None:
         from selenium.common.exceptions import StaleElementReferenceException
 
-        stale_enter_attempted = False
+        stale_send_attempted = False
         for attempt in range(1, 4):
             try:
                 composer = self._fresh_message_composer(by, wait)
                 composer_text = self._composer_text(composer)
                 if not normalize_composer_text(composer_text):
-                    if not stale_enter_attempted:
+                    if not stale_send_attempted:
                         raise BrowserAutomationError(
-                            "The message draft disappeared before Enter was pressed; "
+                            "The message draft disappeared before Send was clicked; "
                             "the message was not sent."
                         )
-                    # A prior Enter may have reached WhatsApp even though the old
+                    # A prior click may have reached WhatsApp even though the old
                     # DOM element became stale before Selenium received the response.
                     logger.info(
                         "Message composer cleared for row %s after a stale send action",
@@ -874,23 +1036,24 @@ class WhatsAppWebSender:
                     return
                 if not composer_contains_complete_message(composer_text, message):
                     raise BrowserAutomationError(
-                        "The message draft changed before sending, so Enter was not "
+                        "The message draft changed before sending, so Send was not "
                         "pressed."
                     )
-                stale_enter_attempted = True
-                composer.send_keys(keys.ENTER)  # type: ignore[attr-defined]
+                send_button = self._fresh_send_button(by, wait)
+                stale_send_attempted = True
+                self._click_element(send_button, by)
                 return
             except StaleElementReferenceException:
                 logger.info(
-                    "WhatsApp replaced the composer at send time for row %s "
-                    "(attempt %s/3); checking whether Enter was applied",
+                    "WhatsApp replaced the send controls for row %s "
+                    "(attempt %s/3); checking whether Send was applied",
                     contact.row_number,
                     attempt,
                 )
                 time.sleep(0.3)
 
         raise BrowserAutomationError(
-            "WhatsApp repeatedly refreshed the message box before Enter could be "
+            "WhatsApp repeatedly refreshed the send controls before the click could be "
             "confirmed; the message was not sent."
         )
 
@@ -910,7 +1073,7 @@ class WhatsAppWebSender:
             # WhatsApp's React UI can replace the composer immediately after it
             # opens, so the typing stage always acquires the current element.
             self._prepare_message_draft(contact, message, by, keys, wait)
-            self._press_send_once(contact, message, by, keys, wait)
+            self._press_send_once(contact, message, by, wait)
 
             def message_was_sent(driver: object) -> bool:
                 if self._visible_dialogs(driver, by):

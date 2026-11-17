@@ -17,6 +17,7 @@ from whatsapp_tool.sender import (
     normalize_dialog_text,
     search_text_indicates_no_result,
     summarize_browser_error,
+    text_contains_whatsapp_username,
     text_looks_like_contact_result,
 )
 
@@ -155,10 +156,17 @@ class FakeKeys:
 class FakeComposerDriver:
     def __init__(self) -> None:
         self.composer = None
+        self.send_button = None
 
     def find_elements(self, _by, selector: str):
         if selector.startswith("footer div[contenteditable") and self.composer:
             return [self.composer]
+        if (
+            "Send" in selector
+            or "compose-btn-send" in selector
+            or "icon='send'" in selector
+        ):
+            return [self.send_button] if self.send_button else []
         return []
 
 
@@ -218,6 +226,37 @@ class FakeComposer:
             self.text = ""
             return
         self.text += "".join(str(value) for value in values)
+
+
+class FakeSendButton:
+    tag_name = "button"
+
+    def __init__(
+        self,
+        driver: FakeComposerDriver,
+        *,
+        stale_on_click: bool = False,
+        replacement_composer=None,
+    ) -> None:
+        self.driver = driver
+        self.stale_on_click = stale_on_click
+        self.replacement_composer = replacement_composer
+        self.click_attempts = 0
+
+    def is_displayed(self) -> bool:
+        return True
+
+    def get_attribute(self, name: str):
+        return "button" if name == "role" else None
+
+    def click(self) -> None:
+        from selenium.common.exceptions import StaleElementReferenceException
+
+        self.click_attempts += 1
+        if self.stale_on_click:
+            self.driver.composer = self.replacement_composer
+            raise StaleElementReferenceException("Send button replaced at click")
+        self.driver.composer.text = ""
 
 
 class SenderTests(unittest.TestCase):
@@ -282,6 +321,10 @@ class SenderTests(unittest.TestCase):
         self.assertFalse(text_looks_like_contact_result("Invite to WhatsApp"))
         self.assertTrue(text_looks_like_contact_result("Saved workshop name"))
 
+    def test_whatsapp_username_is_recognized_without_logging_its_value(self) -> None:
+        self.assertTrue(text_contains_whatsapp_username("Display name\n@user_name.1"))
+        self.assertFalse(text_contains_whatsapp_username("Display name only"))
+
     def test_single_saved_name_result_is_selected(self) -> None:
         from selenium.webdriver.common.by import By
 
@@ -299,6 +342,17 @@ class SenderTests(unittest.TestCase):
         sender = self.make_sender()
         driver = FakeResultDriver(
             [FakeContactResult("Workshop one"), FakeContactResult("Workshop two")]
+        )
+
+        self.assertIsNone(sender._matching_contact_result(driver, By, "60189052999"))
+
+    def test_username_alone_cannot_disambiguate_multiple_contacts(self) -> None:
+        from selenium.webdriver.common.by import By
+
+        sender = self.make_sender()
+        username_result = FakeContactResult("Display name\n@user_name.1")
+        driver = FakeResultDriver(
+            [FakeContactResult("Another contact"), username_result]
         )
 
         self.assertIsNone(sender._matching_contact_result(driver, By, "60189052999"))
@@ -329,19 +383,20 @@ class SenderTests(unittest.TestCase):
         self.assertIs(result, fresh_composer)
         self.assertEqual(fresh_composer.text, "Hello\nworld")
 
-    def test_stale_enter_does_not_duplicate_send(self) -> None:
+    def test_stale_send_button_does_not_duplicate_send(self) -> None:
         from selenium.webdriver.common.by import By
 
         sender = self.make_sender()
         driver = FakeComposerDriver()
         cleared_composer = FakeComposer(driver)
-        stale_composer = FakeComposer(
+        composer = FakeComposer(driver, text="Hello world")
+        stale_send_button = FakeSendButton(
             driver,
-            text="Hello world",
-            stale_on_enter=True,
-            replacement=cleared_composer,
+            stale_on_click=True,
+            replacement_composer=cleared_composer,
         )
-        driver.composer = stale_composer
+        driver.composer = composer
+        driver.send_button = stale_send_button
         sender.driver = driver
 
         with patch("whatsapp_tool.sender.time.sleep", return_value=None):
@@ -349,14 +404,36 @@ class SenderTests(unittest.TestCase):
                 Contact(4, "+601", phone="60111111111"),
                 "Hello world",
                 By,
-                FakeKeys,
                 ImmediateWait,
             )
 
-        self.assertEqual(stale_composer.enter_attempts, 1)
+        self.assertEqual(stale_send_button.click_attempts, 1)
+        self.assertEqual(composer.enter_attempts, 0)
         self.assertEqual(cleared_composer.enter_attempts, 0)
 
-    def test_empty_draft_before_enter_is_not_reported_as_sent(self) -> None:
+    def test_send_button_is_clicked_instead_of_enter(self) -> None:
+        from selenium.webdriver.common.by import By
+
+        sender = self.make_sender()
+        driver = FakeComposerDriver()
+        composer = FakeComposer(driver, text="Hello @user_name")
+        send_button = FakeSendButton(driver)
+        driver.composer = composer
+        driver.send_button = send_button
+        sender.driver = driver
+
+        sender._press_send_once(
+            Contact(4, "+601", phone="60111111111"),
+            "Hello @user_name",
+            By,
+            ImmediateWait,
+        )
+
+        self.assertEqual(send_button.click_attempts, 1)
+        self.assertEqual(composer.enter_attempts, 0)
+        self.assertEqual(composer.text, "")
+
+    def test_empty_draft_before_send_click_is_not_reported_as_sent(self) -> None:
         from selenium.webdriver.common.by import By
 
         sender = self.make_sender()
@@ -369,7 +446,6 @@ class SenderTests(unittest.TestCase):
                 Contact(4, "+601", phone="60111111111"),
                 "Hello world",
                 By,
-                FakeKeys,
                 ImmediateWait,
             )
 
