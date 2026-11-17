@@ -69,6 +69,8 @@ _GENERIC_SEARCH_BOX_SELECTOR = (
     "div[contenteditable='true'][role='textbox'][data-tab='3']"
 )
 
+_MESSAGE_COMPOSER_SELECTOR = "footer div[contenteditable='true'][role='textbox']"
+
 _CONTACT_RESULT_SELECTORS = (
     "div[role='listitem']",
     "div[data-testid='cell-frame-container']",
@@ -155,6 +157,18 @@ def text_looks_like_contact_result(text: str) -> bool:
             for phrase in _NON_CONTACT_RESULT_PHRASES
         )
     )
+
+
+def normalize_composer_text(text: str) -> str:
+    cleaned = text.replace("\u00a0", " ")
+    for invisible_character in ("\u200b", "\u200e", "\u200f", "\ufeff"):
+        cleaned = cleaned.replace(invisible_character, "")
+    return " ".join(cleaned.split())
+
+
+def composer_contains_complete_message(composer_text: str, message: str) -> bool:
+    expected = normalize_composer_text(message)
+    return bool(expected and normalize_composer_text(composer_text) == expected)
 
 
 class BrowserAutomationError(RuntimeError):
@@ -708,12 +722,8 @@ class WhatsAppWebSender:
             dialogs = self._visible_dialogs(driver, by)
             if dialogs:
                 return "dialog", dialogs[0]
-            composers = driver.find_elements(  # type: ignore[attr-defined]
-                by.CSS_SELECTOR,
-                "footer div[contenteditable='true'][role='textbox']",  # type: ignore[attr-defined]
-            )
-            visible = [element for element in composers if self._is_visible(element)]
-            return ("composer", visible[-1]) if visible else False
+            composer = self._visible_message_composer(driver, by)
+            return ("composer", composer) if composer is not None else False
 
         deadline = time.monotonic() + self.settings.chat_timeout_seconds
         try:
@@ -755,45 +765,166 @@ class WhatsAppWebSender:
 
         raise BrowserAutomationError("The message composer did not become available.")
 
+    def _visible_message_composer(self, driver: object, by: object) -> object | None:
+        composers = driver.find_elements(  # type: ignore[attr-defined]
+            by.CSS_SELECTOR,
+            _MESSAGE_COMPOSER_SELECTOR,  # type: ignore[attr-defined]
+        )
+        visible = [element for element in composers if self._is_visible(element)]
+        return visible[-1] if visible else None
+
+    @staticmethod
+    def _composer_text(composer: object) -> str:
+        inner_text = composer.get_attribute("innerText")  # type: ignore[attr-defined]
+        if inner_text is not None:
+            return str(inner_text)
+        return str(composer.get_attribute("textContent") or "")  # type: ignore[attr-defined]
+
+    def _fresh_message_composer(self, by: object, wait: object, timeout: float = 10):
+        assert self.driver is not None
+        return wait(self.driver, timeout).until(
+            lambda driver: self._visible_message_composer(driver, by) or False
+        )
+
+    def _prepare_message_draft(
+        self,
+        contact: Contact,
+        message: str,
+        by: object,
+        keys: object,
+        wait: object,
+    ) -> object:
+        assert self.driver is not None
+        from selenium.common.exceptions import (
+            StaleElementReferenceException,
+            WebDriverException,
+        )
+
+        modifier = keys.COMMAND if sys.platform == "darwin" else keys.CONTROL
+        for attempt in range(1, 4):
+            try:
+                composer = self._fresh_message_composer(by, wait)
+                composer.click()  # type: ignore[attr-defined]
+                if normalize_composer_text(self._composer_text(composer)):
+                    composer.send_keys(modifier, "a")  # type: ignore[attr-defined]
+                    composer.send_keys(keys.BACKSPACE)  # type: ignore[attr-defined]
+
+                lines = message.split("\n")
+                for index, line in enumerate(lines):
+                    composer = self._fresh_message_composer(by, wait)
+                    if line:
+                        composer.send_keys(line)  # type: ignore[attr-defined]
+                    if index < len(lines) - 1:
+                        composer = self._fresh_message_composer(by, wait)
+                        composer.send_keys(keys.SHIFT, keys.ENTER)  # type: ignore[attr-defined]
+
+                composer = self._fresh_message_composer(by, wait)
+                if composer_contains_complete_message(
+                    self._composer_text(composer), message
+                ):
+                    return composer
+                logger.warning(
+                    "Message draft verification failed for row %s (attempt %s/3)",
+                    contact.row_number,
+                    attempt,
+                )
+            except StaleElementReferenceException:
+                logger.info(
+                    "WhatsApp replaced the message composer for row %s; "
+                    "retrying the draft (attempt %s/3)",
+                    contact.row_number,
+                    attempt,
+                )
+            except WebDriverException:
+                raise
+            time.sleep(0.3)
+
+        raise BrowserAutomationError(
+            "WhatsApp repeatedly refreshed the message box while typing; "
+            "the message was not sent."
+        )
+
+    def _press_send_once(
+        self,
+        contact: Contact,
+        message: str,
+        by: object,
+        keys: object,
+        wait: object,
+    ) -> None:
+        from selenium.common.exceptions import StaleElementReferenceException
+
+        stale_enter_attempted = False
+        for attempt in range(1, 4):
+            try:
+                composer = self._fresh_message_composer(by, wait)
+                composer_text = self._composer_text(composer)
+                if not normalize_composer_text(composer_text):
+                    if not stale_enter_attempted:
+                        raise BrowserAutomationError(
+                            "The message draft disappeared before Enter was pressed; "
+                            "the message was not sent."
+                        )
+                    # A prior Enter may have reached WhatsApp even though the old
+                    # DOM element became stale before Selenium received the response.
+                    logger.info(
+                        "Message composer cleared for row %s after a stale send action",
+                        contact.row_number,
+                    )
+                    return
+                if not composer_contains_complete_message(composer_text, message):
+                    raise BrowserAutomationError(
+                        "The message draft changed before sending, so Enter was not "
+                        "pressed."
+                    )
+                stale_enter_attempted = True
+                composer.send_keys(keys.ENTER)  # type: ignore[attr-defined]
+                return
+            except StaleElementReferenceException:
+                logger.info(
+                    "WhatsApp replaced the composer at send time for row %s "
+                    "(attempt %s/3); checking whether Enter was applied",
+                    contact.row_number,
+                    attempt,
+                )
+                time.sleep(0.3)
+
+        raise BrowserAutomationError(
+            "WhatsApp repeatedly refreshed the message box before Enter could be "
+            "confirmed; the message was not sent."
+        )
+
     def _type_and_send_message(
         self,
         contact: Contact,
         message: str,
-        composer: object,
         by: object,
         keys: object,
         wait: object,
     ) -> None:
         assert self.driver is not None
         from selenium.common.exceptions import TimeoutException, WebDriverException
-        from selenium.webdriver.common.action_chains import ActionChains
 
         try:
             self._clear_stale_dialogs(by, keys)
-            composer.click()  # type: ignore[attr-defined]
-            lines = message.split("\n")
-            for index, line in enumerate(lines):
-                if line:
-                    composer.send_keys(line)  # type: ignore[attr-defined]
-                if index < len(lines) - 1:
-                    ActionChains(self.driver).key_down(keys.SHIFT).send_keys(
-                        keys.ENTER
-                    ).key_up(keys.SHIFT).perform()
-
-            composer_text = (composer.get_attribute("textContent") or "").strip()  # type: ignore[attr-defined]
-            if not composer_text:
-                raise BrowserAutomationError(
-                    "WhatsApp opened the chat but did not accept the message text."
-                )
-            composer.send_keys(keys.ENTER)  # type: ignore[attr-defined]
+            # WhatsApp's React UI can replace the composer immediately after it
+            # opens, so the typing stage always acquires the current element.
+            self._prepare_message_draft(contact, message, by, keys, wait)
+            self._press_send_once(contact, message, by, keys, wait)
 
             def message_was_sent(driver: object) -> bool:
                 if self._visible_dialogs(driver, by):
                     return False
                 try:
-                    return not (composer.get_attribute("textContent") or "").strip()  # type: ignore[attr-defined]
+                    fresh_composer = self._visible_message_composer(driver, by)
+                    return bool(
+                        fresh_composer is not None
+                        and not normalize_composer_text(
+                            self._composer_text(fresh_composer)
+                        )
+                    )
                 except WebDriverException:
-                    return True
+                    return False
 
             wait(self.driver, 10).until(message_was_sent)
         except BrowserAutomationError:
@@ -824,8 +955,8 @@ class WhatsAppWebSender:
         from selenium.webdriver.support.ui import WebDriverWait
 
         self._select_contact_from_search(contact, By, Keys, WebDriverWait)
-        composer = self._wait_for_message_composer(contact, By, Keys, WebDriverWait)
-        self._type_and_send_message(contact, message, composer, By, Keys, WebDriverWait)
+        self._wait_for_message_composer(contact, By, Keys, WebDriverWait)
+        self._type_and_send_message(contact, message, By, Keys, WebDriverWait)
 
     def _wait_between_messages(self, seconds: int) -> bool:
         remaining = seconds

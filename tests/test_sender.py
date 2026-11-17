@@ -9,9 +9,11 @@ from whatsapp_tool.sender import (
     SenderSettings,
     WhatsAppWebSender,
     build_chrome_environment,
+    composer_contains_complete_message,
     contact_result_matches,
     dialog_indicates_unavailable_contact,
     digits_only,
+    normalize_composer_text,
     normalize_dialog_text,
     search_text_indicates_no_result,
     summarize_browser_error,
@@ -131,6 +133,93 @@ class FakeResultDriver:
         return []
 
 
+class ImmediateWait:
+    def __init__(self, driver, _timeout: float) -> None:
+        self.driver = driver
+
+    def until(self, condition):
+        result = condition(self.driver)
+        if not result:
+            raise AssertionError("Immediate wait condition was not satisfied")
+        return result
+
+
+class FakeKeys:
+    COMMAND = "COMMAND"
+    CONTROL = "CONTROL"
+    BACKSPACE = "BACKSPACE"
+    SHIFT = "SHIFT"
+    ENTER = "ENTER"
+
+
+class FakeComposerDriver:
+    def __init__(self) -> None:
+        self.composer = None
+
+    def find_elements(self, _by, selector: str):
+        if selector.startswith("footer div[contenteditable") and self.composer:
+            return [self.composer]
+        return []
+
+
+class FakeComposer:
+    def __init__(
+        self,
+        driver: FakeComposerDriver,
+        text: str = "",
+        *,
+        stale_on_click: bool = False,
+        stale_on_enter: bool = False,
+        replacement=None,
+    ) -> None:
+        self.driver = driver
+        self.text = text
+        self.stale_on_click = stale_on_click
+        self.stale_on_enter = stale_on_enter
+        self.replacement = replacement
+        self.enter_attempts = 0
+        self.selected_all = False
+
+    def is_displayed(self) -> bool:
+        return True
+
+    def click(self) -> None:
+        if self.stale_on_click:
+            from selenium.common.exceptions import StaleElementReferenceException
+
+            self.driver.composer = self.replacement
+            raise StaleElementReferenceException("Composer replaced after click")
+
+    def get_attribute(self, name: str):
+        return self.text if name in {"innerText", "textContent"} else None
+
+    def send_keys(self, *values) -> None:
+        if values == (FakeKeys.CONTROL, "a") or values == (
+            FakeKeys.COMMAND,
+            "a",
+        ):
+            self.selected_all = True
+            return
+        if values == (FakeKeys.BACKSPACE,):
+            if self.selected_all:
+                self.text = ""
+                self.selected_all = False
+            return
+        if values == (FakeKeys.SHIFT, FakeKeys.ENTER):
+            self.text += "\n"
+            return
+        if values == (FakeKeys.ENTER,):
+            from selenium.common.exceptions import StaleElementReferenceException
+
+            self.enter_attempts += 1
+            if self.stale_on_enter:
+                self.driver.composer = self.replacement
+                raise StaleElementReferenceException("Composer replaced at Enter")
+            self.text = ""
+            return
+        self.text += "".join(str(value) for value in values)
+
+
 class SenderTests(unittest.TestCase):
     @staticmethod
     def make_sender() -> WhatsAppWebSender:
@@ -176,6 +265,13 @@ class SenderTests(unittest.TestCase):
         )
         self.assertFalse(contact_result_matches("+60 19-770 4052", "60189052999"))
 
+    def test_composer_message_comparison_ignores_rendering_characters(self) -> None:
+        self.assertEqual(normalize_composer_text("Hello\u200b\n world"), "Hello world")
+        self.assertTrue(
+            composer_contains_complete_message("Hello\nworld", "Hello\nworld")
+        )
+        self.assertFalse(composer_contains_complete_message("Hello", "Hello world"))
+
     def test_no_contact_search_result_is_recognized(self) -> None:
         self.assertTrue(search_text_indicates_no_result("No contacts found"))
         self.assertTrue(search_text_indicates_no_result("Invite to WhatsApp"))
@@ -206,6 +302,78 @@ class SenderTests(unittest.TestCase):
         )
 
         self.assertIsNone(sender._matching_contact_result(driver, By, "60189052999"))
+
+    def test_stale_composer_is_reacquired_while_building_draft(self) -> None:
+        from selenium.webdriver.common.by import By
+
+        sender = self.make_sender()
+        driver = FakeComposerDriver()
+        fresh_composer = FakeComposer(driver)
+        stale_composer = FakeComposer(
+            driver,
+            stale_on_click=True,
+            replacement=fresh_composer,
+        )
+        driver.composer = stale_composer
+        sender.driver = driver
+
+        with patch("whatsapp_tool.sender.time.sleep", return_value=None):
+            result = sender._prepare_message_draft(
+                Contact(4, "+601", phone="60111111111"),
+                "Hello\nworld",
+                By,
+                FakeKeys,
+                ImmediateWait,
+            )
+
+        self.assertIs(result, fresh_composer)
+        self.assertEqual(fresh_composer.text, "Hello\nworld")
+
+    def test_stale_enter_does_not_duplicate_send(self) -> None:
+        from selenium.webdriver.common.by import By
+
+        sender = self.make_sender()
+        driver = FakeComposerDriver()
+        cleared_composer = FakeComposer(driver)
+        stale_composer = FakeComposer(
+            driver,
+            text="Hello world",
+            stale_on_enter=True,
+            replacement=cleared_composer,
+        )
+        driver.composer = stale_composer
+        sender.driver = driver
+
+        with patch("whatsapp_tool.sender.time.sleep", return_value=None):
+            sender._press_send_once(
+                Contact(4, "+601", phone="60111111111"),
+                "Hello world",
+                By,
+                FakeKeys,
+                ImmediateWait,
+            )
+
+        self.assertEqual(stale_composer.enter_attempts, 1)
+        self.assertEqual(cleared_composer.enter_attempts, 0)
+
+    def test_empty_draft_before_enter_is_not_reported_as_sent(self) -> None:
+        from selenium.webdriver.common.by import By
+
+        sender = self.make_sender()
+        driver = FakeComposerDriver()
+        driver.composer = FakeComposer(driver)
+        sender.driver = driver
+
+        with self.assertRaisesRegex(BrowserAutomationError, "draft disappeared"):
+            sender._press_send_once(
+                Contact(4, "+601", phone="60111111111"),
+                "Hello world",
+                By,
+                FakeKeys,
+                ImmediateWait,
+            )
+
+        self.assertEqual(driver.composer.enter_attempts, 0)
 
     def test_stale_dialog_is_closed_before_next_contact(self) -> None:
         from selenium.webdriver.common.by import By
